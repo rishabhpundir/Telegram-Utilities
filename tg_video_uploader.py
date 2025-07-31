@@ -195,7 +195,8 @@ async def process_video(client: TelegramClient,
             CHANNEL_ID, 
             video_path, 
             caption=caption,
-            progress_callback=upload_progress
+            progress_callback=upload_progress,
+            supports_streaming=True
         )
         logfile.write(f"SUCCESS,{url},{title or ''}\n")
         logfile.flush()                                 # ensure line is written
