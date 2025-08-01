@@ -11,16 +11,22 @@ import os
 import re
 import sys
 import csv
+import uuid
+import shutil
+import ffmpeg
 import asyncio
 import aiohttp
 import aiofiles
+import requests
 import traceback
 import subprocess 
 import datetime as dt
-from pathlib import Path
 
+from pathlib import Path
+from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from moviepy import VideoFileClip
 from telethon.errors import RPCError, FloodWaitError
 
 # ──────────────────────────  CONFIG  ────────────────────────── #
@@ -36,6 +42,7 @@ DOWNLOAD_DIR  = Path("videos")                                 # temp downloads
 TIMEOUT_SEC   = 600                                            # per-video timeout
 
 URL_RE = re.compile(r'https?://', re.I)
+VALID_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".flv")
 
 # ───────────────────────  HELPER FUNCTIONS  ─────────────────── #
 
@@ -62,8 +69,7 @@ def get_resolution(path: Path) -> str | None:
 
 def parse_manifest(path: Path):
     """
-    Each line:  URL , Optional Title
-    Blank title (or no comma) ⇒ None
+    Each line: URL, Optional Title, Optional Thumb Timestamp (HH:MM:SS), Optional End Length (HH:MM:SS)
     """
     videos = []
     with path.open(newline='', encoding="utf-8") as f:
@@ -73,13 +79,46 @@ def parse_manifest(path: Path):
                 continue
             url = row[0].strip()
             if not URL_RE.match(url):
-                continue                                # ignore stray lines
+                continue
             title = row[1].strip() if len(row) > 1 and row[1].strip() else None
-            videos.append((url, title))
+            thumb_ts = row[2].strip() if len(row) > 2 and row[2].strip() else None
+            end_ts = row[3].strip() if len(row) > 3 and row[3].strip() else None
+            videos.append((url, title, thumb_ts, end_ts))
     return videos
 
 
-VALID_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".flv")
+def extract_thumb_and_trim(input_path: Path, thumb_ts: str | None, end_ts: str | None) -> tuple[Path, Path]:
+    """
+    Returns: (new_video_path, thumb_path)
+    - Trims the video if end_ts is provided.
+    - Extracts thumbnail at thumb_ts or midpoint if not given.
+    """
+
+    thumb_path = input_path.with_name(f"{input_path.stem}_thumb.jpg")
+    final_video_path = input_path
+
+    # Trim video if end_ts given
+    if end_ts:
+        final_video_path = input_path.with_name(f"{input_path.stem}_trimmed.mp4")
+        ffmpeg.input(str(input_path), t=end_ts).output(str(final_video_path), c="copy").overwrite_output().run()
+    
+    # Extract midpoint if thumb_ts not given
+    if not thumb_ts:
+        with VideoFileClip(str(final_video_path)) as clip:
+            mid_time = clip.duration / 2
+            thumb_ts = str(dt.timedelta(seconds=int(mid_time)))
+
+    # ffmpeg.input(str(final_video_path), ss=thumb_ts).output(str(thumb_path), vframes=1).overwrite_output().run()
+    ffmpeg.input(str(final_video_path), ss=thumb_ts).output(
+        str(thumb_path),
+        vframes=1,
+        format="image2",
+        vcodec="mjpeg",
+        **{"strict": "-2"},
+        loglevel="error"
+    ).overwrite_output().run()
+    return final_video_path, thumb_path
+
 
 async def _direct_http_download(url: str) -> Path:
     filename = url.split("?")[0].split("/")[-1]           # crude but works if ext is present
@@ -93,14 +132,12 @@ async def _direct_http_download(url: str) -> Path:
     return dest
 
 
-import requests, uuid
 async def download_video(url: str) -> Path:
     """
     1. Try yt-dlp (with force_generic_extractor).
     2. If yt-dlp bails (eg. weird .php link), fall back to a simple
        streamed HTTP download with live progress.
     """
-    from yt_dlp import YoutubeDL
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     loop = asyncio.get_running_loop()
 
@@ -154,8 +191,6 @@ async def download_video(url: str) -> Path:
         return await loop.run_in_executor(None, _direct_blocking)
 
 
-
-
 def build_caption(file_path: Path, custom_title: str | None = None) -> str:
     size_mb = round(file_path.stat().st_size / 1_048_576, 1)
     name    = file_path.stem
@@ -166,7 +201,7 @@ def build_caption(file_path: Path, custom_title: str | None = None) -> str:
         parts.append(f"📺 {custom_title}")
 
     parts += [
-        f"Name: {name}",
+        # f"Name: {name}",
         f"Size: {size_mb} MB",
         f"Resolution: {res}",
         f"Uploaded: {dt.datetime.now():%d %b %Y}",
@@ -185,22 +220,25 @@ def upload_progress(cur: int, tot: int):
 async def process_video(client: TelegramClient,
                         url: str,
                         title: str | None,
+                        thumb_ts: str | None,
+                        end_ts: str | None,
                         logfile):
-    video_path = None                                   # ← initialise
+    video_path = None
     try:
-        video_path = await asyncio.wait_for(download_video(url),
-                                             timeout=TIMEOUT_SEC)
-        caption = build_caption(video_path, title)
+        video_path = await asyncio.wait_for(download_video(url), timeout=TIMEOUT_SEC)
+        processed_video, thumb_path = extract_thumb_and_trim(video_path, thumb_ts, end_ts)
+
+        caption = build_caption(processed_video, title)
         await client.send_file(
             CHANNEL_ID, 
-            video_path, 
+            processed_video, 
             caption=caption,
             progress_callback=upload_progress,
             supports_streaming=True,
-            thumb=video_path,
+            thumb=thumb_path
         )
         logfile.write(f"SUCCESS,{url},{title or ''}\n")
-        logfile.flush()                                 # ensure line is written
+        logfile.flush()
     except asyncio.TimeoutError:
         logfile.write(f"TIMEOUT,{url},{title or ''}\n")
         logfile.flush()
@@ -211,13 +249,11 @@ async def process_video(client: TelegramClient,
         logfile.write(f"FAILED,{url},{title or ''},Other:{e}\n")
         logfile.flush()
     finally:
-        # optional cleanup – only if we actually downloaded something
         if video_path and video_path.exists():
             try:
                 video_path.unlink()
             except Exception:
                 pass
-
 
 # ─────────────────────────────  MAIN  ───────────────────────── #
 
@@ -238,15 +274,18 @@ async def main():
 
         print(f"▶️  Starting upload of {len(videos)} video(s)…")
         with log_path.open("w", encoding="utf-8") as log:
-            for url, title in videos:
-                await process_video(client, url, title, log)
+            for index, (url, title, thumb_ts, end_ts) in enumerate(videos, 1):
+                print("-" * 50)
+                print(f"#{index}. Processing : {title}")
+                await process_video(client, url, title, thumb_ts, end_ts, log)
+
 
         await client.disconnect()
         print(f"✅ Done. Detailed run log: {log_path.resolve()}")
     except Exception as e:
         print("Error: \n", traceback.format_exc())
     finally:
-        os.removedirs(DOWNLOAD_DIR)
+        shutil.rmtree(DOWNLOAD_DIR)
 
 
 if __name__ == "__main__":
