@@ -19,7 +19,6 @@ moviepy==2.2.1
 multidict==6.6.3
 numpy==2.3.2
 pillow==11.3.0
-playwright==1.53.0
 proglog==0.1.12
 propcache==0.3.2
 pyaes==1.6.1
