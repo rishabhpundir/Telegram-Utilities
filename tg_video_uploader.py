@@ -50,19 +50,39 @@ def timestamp(fmt="%H%M%S_%d%m%Y") -> str:
     return dt.datetime.now().strftime(fmt)
 
 
-def get_resolution(path: Path) -> str | None:
+def get_media_info(path: Path) -> tuple[str, str] | None:
     """
-    Returns WxH string by asking ffprobe (must have ffmpeg installed).
+    Returns (resolution, runtime) → ("1920x1080", "HH:MM:SS")
     """
     try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=s=x:p=0", str(path)
-        ]
-        out = subprocess.check_output(cmd, text=True).strip()
-        return out or None          # e.g. "1920x1080"
+        # ── resolution ────────────────────────────────────────────
+        res = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=s=x:p=0", str(path),
+            ],
+            text=True,
+        ).strip()
+
+        # ── duration (in seconds) ─────────────────────────────────
+        dur_sec = float(
+            subprocess.check_output(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                text=True,
+            ).strip()
+        )
+        h, m = divmod(int(dur_sec + 0.5), 3600)
+        m, s = divmod(m, 60)
+        runtime = f"{h:02d}:{m:02d}:{s:02d}"
+
+        return res, runtime
     except Exception:
         return None
 
@@ -107,16 +127,17 @@ def extract_thumb_and_trim(input_path: Path, thumb_ts: str | None, end_ts: str |
         with VideoFileClip(str(final_video_path)) as clip:
             mid_time = clip.duration / 2
             thumb_ts = str(dt.timedelta(seconds=int(mid_time)))
-
-    # ffmpeg.input(str(final_video_path), ss=thumb_ts).output(str(thumb_path), vframes=1).overwrite_output().run()
+            
     ffmpeg.input(str(final_video_path), ss=thumb_ts).output(
         str(thumb_path),
         vframes=1,
-        format="image2",
         vcodec="mjpeg",
-        **{"strict": "-2"},
+        vf="scale='min(iw\\,320)':-2",
+        **{"qscale:v": "2", "strict": "-2"},
+        format="image2",
         loglevel="error"
     ).overwrite_output().run()
+
     return final_video_path, thumb_path
 
 
@@ -193,18 +214,21 @@ async def download_video(url: str) -> Path:
 
 def build_caption(file_path: Path, custom_title: str | None = None) -> str:
     size_mb = round(file_path.stat().st_size / 1_048_576, 1)
-    name    = file_path.stem
-    res     = get_resolution(file_path) or "—"
+    name = file_path.stem
+    res, runtime = get_media_info(file_path) or "—"
 
     parts: list[str] = []
     if custom_title:
-        parts.append(f"📺 {custom_title}")
+        parts.append(f"<b>▶️ {custom_title.title()}</b>\n")
 
     parts += [
         # f"Name: {name}",
-        f"Size: {size_mb} MB",
-        f"Resolution: {res}",
-        f"Uploaded: {dt.datetime.now():%d %b %Y}",
+        "—" * 11,
+        f"Quality: {res}p",
+        f"Length: {runtime.replace(":", "꞉")}",
+        f"File Size: {size_mb}MB",
+        f"Added: {dt.datetime.now():%d-%m-%Y}",
+        "—" * 11,
     ]
     return "\n".join(parts)
 
@@ -232,10 +256,11 @@ async def process_video(client: TelegramClient,
         await client.send_file(
             CHANNEL_ID, 
             processed_video, 
-            caption=caption,
+            caption=f"<i>{caption}</i>",
             progress_callback=upload_progress,
             supports_streaming=True,
-            thumb=thumb_path
+            thumb=thumb_path,
+            parse_mode="html"
         )
         logfile.write(f"SUCCESS,{url},{title or ''}\n")
         logfile.flush()
